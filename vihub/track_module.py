@@ -313,13 +313,111 @@ class VideoInstanceCutter(nn.Module):
 
         return all_outputs
 
+    def inference(self, frame_embeds, frame_reid_embeds, mask_features, frames_info, start_frame_id, resume=False, to_store="cpu"):
+        ori_mask_features = mask_features
+        mask_features_shape = mask_features.shape
+        mask_features = self.mask_feature_proj(mask_features.flatten(0, 1)).reshape(
+            *mask_features_shape)  # (b, t, c, h, w)
+
+        frame_embeds = frame_embeds.permute(2, 3, 0, 1)  # t, q, b, c
+        T, fQ, B, _ = frame_embeds.shape
+        assert B == 1
+
+        for i in range(T):
+            if i == 0 and resume is False:
+                self._clear_memory()
+            det_outputs, ms_outputs = [], []
+            new_ins_embeds = self.new_ins_embeds.weight.unsqueeze(1).repeat(self.num_new_ins, B, 1)  # nq, b, c
+            single_frame_embeds = frame_embeds[i]  # q, b, c
+
+            frame_queries_pos = self.get_mask_pos_embed(frames_info["pred_masks"][i][0][None],
+                                                        ori_mask_features[:, i, ...])
+
+            matched_frame_query_id_for_each_trc_query = self.match_with_embeds(single_frame_embeds, frames_info, i)
+            self.track_embeds = frame_queries_pos[
+                matched_frame_query_id_for_each_trc_query] if self.track_queries is not None else None
+
+            output = new_ins_embeds
+            for j in range(3):
+                output = self.transformer_cross_attention_layers[j](
+                    output, single_frame_embeds,
+                    query_pos=frame_queries_pos, pos=frame_queries_pos,
+                )
+                output = self.transformer_self_attention_layers[j](
+                    output,
+                    torch.cat([self.track_queries, output], dim=0) if self.track_queries is not None else output,
+                    query_pos=frame_queries_pos,
+                    pos=torch.cat([self.track_embeds, frame_queries_pos],
+                                  dim=0) if self.track_embeds is not None else frame_queries_pos,
+                )
+                output = self.transformer_ffn_layers[j](output)
+                det_outputs.append(output)
+
+            trc_det_queries = torch.cat([self.track_queries, det_outputs[-1]],
+                                        dim=0) if self.track_queries is not None else det_outputs[-1]
+            trc_det_queries_pos = torch.cat([self.track_embeds, frame_queries_pos],
+                                            dim=0) if self.track_embeds is not None else frame_queries_pos
+
+            for j in range(3, self.num_layers):
+                trc_det_queries = self.transformer_cross_attention_layers[j](
+                    trc_det_queries, single_frame_embeds,
+                    query_pos=trc_det_queries_pos, pos=frame_queries_pos
+                )
+                trc_det_queries = self.transformer_self_attention_layers[j](trc_det_queries)
+                trc_det_queries = self.transformer_ffn_layers[j](trc_det_queries)
+                ms_outputs.append(trc_det_queries)
+
+            # det_outputs = torch.stack(det_outputs, dim=0)  # (L1, nQ, B, C)
+            # det_outputs_class, det_outputs_mask = self.prediction(det_outputs, mask_features[:, i, ...])
+            ms_outputs = torch.stack(ms_outputs, dim=0)  # (L2, tQ+nQ, B, C)
+            ms_outputs_class, ms_outputs_mask = self.prediction(ms_outputs, mask_features[:, i, ...])
+
+            cur_seq_ids = []
+            pred_scores = torch.max(ms_outputs_class[-1, 0].softmax(-1)[:, :-1], dim=1)[0]
+            valid_queries_bool = pred_scores > self.inference_select_thr
+            for k, valid in enumerate(valid_queries_bool):
+                if self.last_seq_ids is not None and k < len(self.last_seq_ids):
+                    seq_id = self.last_seq_ids[k]
+                else:
+                    seq_id = random.randint(0, 100000)
+                    while seq_id in self.video_ins_hub:
+                        seq_id = random.randint(0, 100000)
+                    assert not seq_id in self.video_ins_hub
+                if valid:
+                    if not seq_id in self.video_ins_hub:
+                        self.video_ins_hub[seq_id] = VideoInstanceSequence(start_frame_id + i, seq_id)
+                    self.video_ins_hub[seq_id].embeds.append(ms_outputs[-1, k, 0, :])
+                    self.video_ins_hub[seq_id].pred_logits.append(ms_outputs_class[-1, 0, k, :])
+                    self.video_ins_hub[seq_id].pred_masks.append(
+                        ms_outputs_mask[-1, 0, k, ...].to(to_store).to(torch.float32))
+                    self.video_ins_hub[seq_id].invalid_frames = 0
+                    self.video_ins_hub[seq_id].appearance.append(True)
+
+                    cur_seq_ids.append(seq_id)
+                elif self.last_seq_ids is not None and seq_id in self.last_seq_ids:
+                    self.video_ins_hub[seq_id].invalid_frames += 1
+                    if self.video_ins_hub[seq_id].invalid_frames >= self.kick_out_frame_num:
+                        self.video_ins_hub[seq_id].dead = True
+                        continue
+                    self.video_ins_hub[seq_id].embeds.append(ms_outputs[-1, k, 0, :])
+                    self.video_ins_hub[seq_id].pred_logits.append(ms_outputs_class[-1, 0, k, :])
+                    self.video_ins_hub[seq_id].pred_masks.append(
+                        ms_outputs_mask[-1, 0, k, ...].to(to_store).to(torch.float32))
+                    # self.video_ins_hub[seq_id].pred_masks.append(
+                    #     torch.zeros_like(outputs_mask[-1, 0, k, ...]).to(to_store).to(torch.float32))
+                    self.video_ins_hub[seq_id].appearance.append(False)
+
+                    cur_seq_ids.append(seq_id)
+            self.last_seq_ids = cur_seq_ids
+            self.track_queries = self.readout("last")
+
     def match_with_embeds(self, cur_frame_embeds, frames_info, frame_id):
         if self.track_queries is None:
             return None
         ref_embeds, cur_embeds = self.track_queries.detach()[:, 0, :], cur_frame_embeds.detach()[:, 0, :]
         ref_embeds = ref_embeds / (ref_embeds.norm(dim=1)[:, None] + 1e-6)
         cur_embeds = cur_embeds / (cur_embeds.norm(dim=1)[:, None] + 1e-6)
-        cos_sim = torch.mm(cur_embeds, ref_embeds.transpose(0, 1))
+        cos_sim = torch.mm(ref_embeds, cur_embeds.transpose(0, 1))
         C = 1 - cos_sim
         largest_cost_indices = torch.max(C, dim=1)[1]  # q',
 
@@ -377,6 +475,19 @@ class VideoInstanceCutter(nn.Module):
             pos_embeds_list.append(pos_embeds.transpose(0, 1))
 
         return torch.cat(pos_embeds_list, dim=0)
+
+    # def filter_new_ins(self, pred_logits, pred_masks):
+    #     """
+    #     pred_logits: tq+nq, k+1
+    #     pred_masks: tq+nq, h, w
+    #     """
+    #     new_ins_scores = F.softmax(pred_logits[-self.num_new_ins:, :], dim=-1)[:, :-1]  # tq+nq, k
+    #     max_scores, max_indices = torch.max(new_ins_scores, dim=1)
+    #     _, sorted_indices = torch.sort(max_scores, dim=0, descending=True)
+    #
+    #
+    #     if self.track_queries is None or self.track_queries.shape[0] == 0:
+
 
     @torch.jit.unused
     def _set_aux_loss(self, outputs_cls, outputs_mask, disappear_tgt_id=None):
