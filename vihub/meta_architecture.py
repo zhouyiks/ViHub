@@ -299,6 +299,7 @@ class ViHub_online(MinVIS):
             stage = 2
         elif self.iter >= 10000:
             stage = 3
+        self.iter += 1
 
         outputs = self.tracker(frame_embeds, frame_reid_embeds, mask_features, video_targets, frame_indices_info, self.new_ins_matcher, stage=stage)
 
